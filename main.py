@@ -40,7 +40,7 @@ mqtt.init_app(app)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "http://localhost:3000",  # React development
+        "https://flextraff-admin-panel.vercel.app/logs",  # React development
         "http://localhost:8001",  # Local testing
         "https://your-frontend-domain.com",  # Production frontend
         # Add your Render URL here once deployed
