@@ -83,7 +83,8 @@ async def message_handler(client, topic, payload, qos, properties):
                     green_times_payload = json.dumps({
                         "green_times": result.get("green_times"),
                         "cycle_time": result.get("cycle_time"),
-                        "junction_id": junction_id
+                        "junction_id": junction_id,
+                        "cycle_id": data.get("cycle_id")
                     })
                     
                     mqtt.client.publish(
