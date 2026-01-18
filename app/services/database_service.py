@@ -13,24 +13,60 @@ load_dotenv()
 class DatabaseService:
     """
     Supabase Database Service for FlexTraff ATCS Backend
-    Handles all database operations without authentication requirements
+    Handles all database operations including system logging
     """
 
     def __init__(self):
-        """Initialize Supabase client"""
         self.supabase_url = os.getenv("SUPABASE_URL")
         self.supabase_service_key = os.getenv("SUPABASE_SERVICE_KEY")
 
         if not self.supabase_url or not self.supabase_service_key:
             raise ValueError(
-                "Missing Supabase credentials. Please check SUPABASE_URL and SUPABASE_SERVICE_KEY in .env file"
+                "Missing SUPABASE_URL or SUPABASE_SERVICE_KEY in environment"
             )
 
         self.supabase: Client = create_client(
             self.supabase_url, self.supabase_service_key
         )
-        self.logger = logging.getLogger(__name__)
-        self.logger.info("Database service initialized successfully")
+
+        self.logger = logging.getLogger("DatabaseService")
+        self.logger.setLevel(logging.INFO)
+
+        self.logger.info("✅ DatabaseService initialized")
+
+    # ------------------------------------------------------------------
+    # 🔥 SYSTEM LOGGING (NEW)
+    # ------------------------------------------------------------------
+
+    async def log_system_event(
+        self,
+        message: str,
+        log_level: str = "INFO",
+        component: str = "backend",
+        junction_id: Optional[int] = None,
+    ) -> None:
+        """
+        Insert system log into system_logs table
+        NEVER raises exception (logging must be safe)
+        """
+        try:
+            log_data = {
+                "timestamp": datetime.utcnow().isoformat(),
+                "log_level": log_level,
+                "component": component,
+                "message": message,
+                "junction_id": junction_id,
+            }
+
+            self.supabase.table("system_logs").insert(log_data).execute()
+
+        except Exception as e:
+            # Logging should never crash the system
+            self.logger.error(f"❌ Failed to insert system log: {e}")
+
+    # ------------------------------------------------------------------
+    # 🚗 VEHICLE DETECTIONS
+    # ------------------------------------------------------------------
 
     async def log_vehicle_detection(
         self,
@@ -39,25 +75,13 @@ class DatabaseService:
         fastag_id: str,
         vehicle_type: str = "car",
     ) -> Dict[str, Any]:
-        """
-        Log vehicle detection to Supabase
-
-        Args:
-            junction_id (int): ID of the traffic junction
-            lane_number (int): Lane number (1-4)
-            fastag_id (str): FastTag ID of the vehicle
-            vehicle_type (str): Type of vehicle (car, truck, bike, etc.)
-
-        Returns:
-            Dict[str, Any]: Inserted record data
-        """
         try:
             detection_data = {
                 "junction_id": junction_id,
                 "lane_number": lane_number,
                 "fastag_id": fastag_id,
                 "vehicle_type": vehicle_type,
-                "detection_timestamp": datetime.now().isoformat(),
+                "detection_timestamp": datetime.utcnow().isoformat(),
                 "processing_status": "processed",
             }
 
@@ -67,17 +91,29 @@ class DatabaseService:
                 .execute()
             )
 
-            if result.data:
-                self.logger.info(
-                    f"Vehicle detection logged: {fastag_id} on lane {lane_number} at junction {junction_id}"
-                )
-                return result.data[0]
-            else:
-                raise Exception("No data returned from insert operation")
+            if not result.data:
+                raise Exception("No data returned from insert")
+
+            await self.log_system_event(
+                message=f"Vehicle detected: FASTag={fastag_id}, lane={lane_number}",
+                component="vehicle_detection",
+                junction_id=junction_id,
+            )
+
+            return result.data[0]
 
         except Exception as e:
-            self.logger.error(f"Failed to log vehicle detection: {str(e)}")
+            await self.log_system_event(
+                message=str(e),
+                log_level="ERROR",
+                component="vehicle_detection",
+                junction_id=junction_id,
+            )
             raise
+
+    # ------------------------------------------------------------------
+    # 🚦 TRAFFIC CYCLES
+    # ------------------------------------------------------------------
 
     async def log_traffic_cycle(
         self,
@@ -87,23 +123,10 @@ class DatabaseService:
         cycle_time: int,
         calculation_time_ms: int,
     ) -> Dict[str, Any]:
-        """
-        Log calculated traffic cycle to Supabase
-
-        Args:
-            junction_id (int): ID of the traffic junction
-            lane_counts (List[int]): Vehicle counts per lane [lane1, lane2, lane3, lane4]
-            green_times (List[int]): Calculated green times [lane1, lane2, lane3, lane4]
-            cycle_time (int): Total cycle time in seconds
-            calculation_time_ms (int): Algorithm execution time in milliseconds
-
-        Returns:
-            Dict[str, Any]: Inserted traffic cycle record
-        """
         try:
             cycle_data = {
                 "junction_id": junction_id,
-                "cycle_start_time": datetime.now().isoformat(),
+                "cycle_start_time": datetime.utcnow().isoformat(),
                 "total_cycle_time": cycle_time,
                 "lane_1_green_time": green_times[0],
                 "lane_2_green_time": green_times[1],
@@ -118,41 +141,44 @@ class DatabaseService:
                 "calculation_time_ms": calculation_time_ms,
             }
 
-            result = self.supabase.table("traffic_cycles").insert(cycle_data).execute()
+            result = (
+                self.supabase.table("traffic_cycles")
+                .insert(cycle_data)
+                .execute()
+            )
 
-            if result.data:
-                cycle_id = result.data[0]["id"]
-                self.logger.info(
-                    f"Traffic cycle logged: ID {cycle_id}, junction {junction_id}, cycle time {cycle_time}s"
-                )
-                return result.data[0]
-            else:
-                raise Exception("No data returned from insert operation")
+            if not result.data:
+                raise Exception("No data returned from insert")
+
+            await self.log_system_event(
+                message=f"Traffic cycle calculated | cycle={cycle_time}s | vehicles={sum(lane_counts)}",
+                component="traffic_calculator",
+                junction_id=junction_id,
+            )
+
+            return result.data[0]
 
         except Exception as e:
-            self.logger.error(f"Failed to log traffic cycle: {str(e)}")
+            await self.log_system_event(
+                message=str(e),
+                log_level="ERROR",
+                component="traffic_calculator",
+                junction_id=junction_id,
+            )
             raise
+
+    # ------------------------------------------------------------------
+    # 📊 QUERIES
+    # ------------------------------------------------------------------
 
     async def get_current_lane_counts(
         self, junction_id: int, time_window_minutes: int = 5
     ) -> List[Dict[str, Any]]:
-        """
-        Get current vehicle counts per lane for a junction within specified time window
-
-        Args:
-            junction_id (int): ID of the traffic junction
-            time_window_minutes (int): Time window in minutes to look back
-
-        Returns:
-            List[Dict[str, Any]]: Lane counts with metadata
-        """
         try:
-            # Calculate time threshold
             time_threshold = (
-                datetime.now() - timedelta(minutes=time_window_minutes)
+                datetime.utcnow() - timedelta(minutes=time_window_minutes)
             ).isoformat()
 
-            # Query vehicle detections within time window
             result = (
                 self.supabase.table("vehicle_detections")
                 .select("lane_number")
@@ -161,83 +187,62 @@ class DatabaseService:
                 .execute()
             )
 
-            # Count vehicles per lane
             lane_counts = {1: 0, 2: 0, 3: 0, 4: 0}
             lane_names = {1: "North", 2: "South", 3: "East", 4: "West"}
 
-            for detection in result.data:
-                lane_number = detection["lane_number"]
-                if lane_number in lane_counts:
-                    lane_counts[lane_number] += 1
+            for row in result.data:
+                ln = row["lane_number"]
+                if ln in lane_counts:
+                    lane_counts[ln] += 1
 
-            # Format response
-            lane_data = []
-            for lane_num in range(1, 5):
-                lane_data.append(
-                    {
-                        "lane": lane_names[lane_num],
-                        "lane_number": lane_num,
-                        "count": lane_counts[lane_num],
-                    }
-                )
-
-            self.logger.debug(
-                f"Current lane counts for junction {junction_id}: {lane_counts}"
-            )
-            return lane_data
+            return [
+                {
+                    "lane": lane_names[i],
+                    "lane_number": i,
+                    "count": lane_counts[i],
+                }
+                for i in range(1, 5)
+            ]
 
         except Exception as e:
-            self.logger.error(f"Failed to get current lane counts: {str(e)}")
+            await self.log_system_event(
+                message=str(e),
+                log_level="ERROR",
+                component="lane_count_query",
+                junction_id=junction_id,
+            )
             return []
 
     async def get_vehicles_count_by_date(
         self, junction_id: int, target_date: date
     ) -> int:
-        """
-        Get total vehicle count for a specific date
-
-        Args:
-            junction_id (int): ID of the traffic junction
-            target_date (date): Date to query
-
-        Returns:
-            int: Total vehicle count for the date
-        """
         try:
-            start_date = target_date.isoformat()
-            end_date = (target_date + timedelta(days=1)).isoformat()
+            start = target_date.isoformat()
+            end = (target_date + timedelta(days=1)).isoformat()
 
             result = (
                 self.supabase.table("vehicle_detections")
                 .select("id", count="exact")
                 .eq("junction_id", junction_id)
-                .gte("detection_timestamp", start_date)
-                .lt("detection_timestamp", end_date)
+                .gte("detection_timestamp", start)
+                .lt("detection_timestamp", end)
                 .execute()
             )
 
-            count = result.count if result.count else 0
-            self.logger.debug(
-                f"Vehicle count for junction {junction_id} on {target_date}: {count}"
-            )
-            return count
+            return result.count or 0
 
         except Exception as e:
-            self.logger.error(f"Failed to get vehicles count by date: {str(e)}")
+            await self.log_system_event(
+                message=str(e),
+                log_level="ERROR",
+                component="vehicle_count_query",
+                junction_id=junction_id,
+            )
             return 0
 
     async def get_current_traffic_cycle(
         self, junction_id: int
     ) -> Optional[Dict[str, Any]]:
-        """
-        Get the most recent traffic cycle for a junction
-
-        Args:
-            junction_id (int): ID of the traffic junction
-
-        Returns:
-            Optional[Dict[str, Any]]: Most recent traffic cycle data or None
-        """
         try:
             result = (
                 self.supabase.table("traffic_cycles")
@@ -248,101 +253,18 @@ class DatabaseService:
                 .execute()
             )
 
-            if result.data:
-                self.logger.debug(
-                    f"Retrieved current traffic cycle for junction {junction_id}"
-                )
-                return result.data[0]
-            else:
-                self.logger.debug(f"No traffic cycles found for junction {junction_id}")
-                return None
+            return result.data[0] if result.data else None
 
         except Exception as e:
-            self.logger.error(f"Failed to get current traffic cycle: {str(e)}")
-            return None
-
-    async def get_recent_detections_with_signals(
-        self, junction_id: int, limit: int = 10
-    ) -> List[Dict[str, Any]]:
-        """
-        Get recent vehicle detections with simulated signal status
-
-        Args:
-            junction_id (int): ID of the traffic junction
-            limit (int): Maximum number of records to return
-
-        Returns:
-            List[Dict[str, Any]]: Recent detection logs with signal status
-        """
-        try:
-            result = (
-                self.supabase.table("vehicle_detections")
-                .select("*")
-                .eq("junction_id", junction_id)
-                .order("detection_timestamp", desc=True)
-                .limit(limit)
-                .execute()
+            await self.log_system_event(
+                message=str(e),
+                log_level="ERROR",
+                component="traffic_cycle_query",
+                junction_id=junction_id,
             )
-
-            enhanced_logs = []
-            for detection in result.data:
-                # Simulate signal status based on lane and time
-                signal_status = self._simulate_signal_status(detection["lane_number"])
-
-                enhanced_logs.append(
-                    {
-                        **detection,
-                        "signal_status": signal_status,
-                        "vehicle_count": 1,
-                        "lane_name": self._get_lane_name(detection["lane_number"]),
-                    }
-                )
-
-            self.logger.debug(
-                f"Retrieved {len(enhanced_logs)} recent detections for junction {junction_id}"
-            )
-            return enhanced_logs
-
-        except Exception as e:
-            self.logger.error(f"Failed to get recent detections: {str(e)}")
-            return []
-
-    async def get_junction_info(self, junction_id: int) -> Optional[Dict[str, Any]]:
-        """
-        Get traffic junction information
-
-        Args:
-            junction_id (int): ID of the traffic junction
-
-        Returns:
-            Optional[Dict[str, Any]]: Junction information or None
-        """
-        try:
-            result = (
-                self.supabase.table("traffic_junctions")
-                .select("*")
-                .eq("id", junction_id)
-                .execute()
-            )
-
-            if result.data:
-                self.logger.debug(f"Retrieved junction info for ID {junction_id}")
-                return result.data[0]
-            else:
-                self.logger.warning(f"Junction {junction_id} not found")
-                return None
-
-        except Exception as e:
-            self.logger.error(f"Failed to get junction info: {str(e)}")
             return None
 
     async def get_all_junctions(self) -> List[Dict[str, Any]]:
-        """
-        Get all traffic junctions
-
-        Returns:
-            List[Dict[str, Any]]: List of all junctions
-        """
         try:
             result = (
                 self.supabase.table("traffic_junctions")
@@ -352,111 +274,32 @@ class DatabaseService:
                 .execute()
             )
 
-            self.logger.debug(f"Retrieved {len(result.data)} active junctions")
-            return result.data
+            return result.data or []
 
         except Exception as e:
-            self.logger.error(f"Failed to get all junctions: {str(e)}")
+            await self.log_system_event(
+                message=str(e),
+                log_level="ERROR",
+                component="junction_query",
+            )
             return []
 
-    async def batch_insert_vehicle_detections(
-        self, detections: List[Dict[str, Any]]
-    ) -> Dict[str, Any]:
-        """
-        Batch insert vehicle detections for high-volume processing
-
-        Args:
-            detections (List[Dict[str, Any]]): List of detection records
-
-        Returns:
-            Dict[str, Any]: Operation result
-        """
-        try:
-            result = (
-                self.supabase.table("vehicle_detections").insert(detections).execute()
-            )
-
-            inserted_count = len(result.data) if result.data else 0
-            self.logger.info(f"Batch inserted {inserted_count} vehicle detections")
-
-            return {
-                "success": True,
-                "inserted_count": inserted_count,
-                "message": f"Successfully inserted {inserted_count} detections",
-            }
-
-        except Exception as e:
-            self.logger.error(f"Batch insert failed: {str(e)}")
-            return {"success": False, "inserted_count": 0, "error": str(e)}
+    # ------------------------------------------------------------------
+    # ❤️ HEALTH
+    # ------------------------------------------------------------------
 
     async def health_check(self) -> Dict[str, Any]:
-        """
-        Check Supabase database connection health
-
-        Returns:
-            Dict[str, Any]: Health check result
-        """
         try:
-            # Simple query to test connection
-            result = (
-                self.supabase.table("traffic_junctions").select("id").limit(1).execute()
-            )
+            self.supabase.table("traffic_junctions").select("id").limit(1).execute()
 
             return {
                 "database_connected": True,
-                "connection_status": "healthy",
-                "message": "Database connection successful",
-                "timestamp": datetime.now().isoformat(),
+                "timestamp": datetime.utcnow().isoformat(),
             }
 
         except Exception as e:
-            self.logger.error(f"Database health check failed: {str(e)}")
             return {
                 "database_connected": False,
-                "connection_status": "error",
                 "error": str(e),
-                "timestamp": datetime.now().isoformat(),
+                "timestamp": datetime.utcnow().isoformat(),
             }
-
-    def _simulate_signal_status(self, lane_number: int) -> str:
-        """
-        Simulate signal status for demo purposes
-
-        Args:
-            lane_number (int): Lane number
-
-        Returns:
-            str: Signal status (Green, Red, Yellow)
-        """
-        import random
-
-        # Simple simulation based on lane number and randomness
-        statuses = ["Green", "Red", "Yellow"]
-        weights = [0.3, 0.6, 0.1]  # More likely to be Red
-        return random.choices(statuses, weights=weights)[0]
-
-    def _get_lane_name(self, lane_number: int) -> str:
-        """
-        Convert lane number to descriptive name
-
-        Args:
-            lane_number (int): Lane number (1-4)
-
-        Returns:
-            str: Lane name
-        """
-        lane_names = {1: "North", 2: "South", 3: "East", 4: "West"}
-        return lane_names.get(lane_number, f"Lane {lane_number}")
-
-    def get_connection_info(self) -> Dict[str, str]:
-        """
-        Get database connection information (for debugging)
-
-        Returns:
-            Dict[str, str]: Connection details
-        """
-        return {
-            "supabase_url": self.supabase_url,
-            "service_key_configured": "Yes" if self.supabase_service_key else "No",
-            "client_initialized": "Yes" if self.supabase else "No",
-        }

@@ -67,6 +67,10 @@ async def startup_event():
     try:
         # Initialize database and calculator
         db_service = DatabaseService()
+        await db_service.log_system_event(
+        message="FlexTraff backend started",
+        component="startup")
+
         traffic_calculator = TrafficCalculator(db_service=db_service)
 
         # Test database connection
@@ -216,6 +220,12 @@ async def calculate_traffic_timing(
     try:
         logger.info(f"📊 Calculating timing for lane counts: {request.lane_counts}")
 
+        await calculator.db_service.log_system_event(
+        message=f"Traffic calculated for lanes {request.lane_counts}",
+        component="traffic_calculator",
+        junction_id=request.junction_id,)
+
+
         green_times, cycle_time = await calculator.calculate_green_times(
             request.lane_counts, junction_id=request.junction_id
         )
@@ -245,13 +255,13 @@ async def log_vehicle_detection(
     """Log vehicle detection event"""
     try:
         # Log vehicle detection in background
-        background_tasks.add_task(
-            db.log_vehicle_detection,
-            request.junction_id,
-            request.lane_number,
-            request.fastag_id,
-            request.vehicle_type,
-        )
+        await db.log_vehicle_detection(
+    request.junction_id,
+    request.lane_number,
+    request.fastag_id,
+    request.vehicle_type,
+)
+
 
         return {
             "status": "success",
