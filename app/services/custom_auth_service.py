@@ -1,42 +1,59 @@
 import logging
 import secrets
+import os
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional, List
 
+from dotenv import load_dotenv
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 from supabase import Client, create_client
 
-from app.config import settings
+from app.services.database_service import DatabaseService
+
+# Load environment variables
+load_dotenv()
 
 
 class CustomAuthService:
     """
-    Custom Username/Password Authentication Service for FlexTraffs
+    Custom Username/Password Authentication Service for FlexTraff
 
-    IMPORTANT RULES:
-    - Users CANNOT register themselves
-    - Users CANNOT change passwords
+    RULES:
+    - Users CANNOT self-register
     - Passwords are ADMIN controlled
     - Roles allowed: OPERATOR, OBSERVER
-    - Junction-level access is enforced via JWT
+    - Junction-level access enforced via JWT
     """
 
     def __init__(self):
-        self.supabase: Client = create_client(
-            settings.SUPABASE_URL, settings.SUPABASE_SERVICE_KEY
-        )
-        self.pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-        self.logger = logging.getLogger(__name__)
+        # Load env vars
+        self.supabase_url = os.getenv("SUPABASE_URL")
+        self.supabase_service_key = os.getenv("SUPABASE_SERVICE_KEY")
+        self.secret_key = os.getenv("JWT_SECRET_KEY")
 
-        # JWT Settings
-        self.secret_key = settings.JWT_SECRET_KEY
+        if not self.supabase_url or not self.supabase_service_key:
+            raise ValueError("SUPABASE_URL or SUPABASE_SERVICE_KEY not set")
+
+        if not self.secret_key:
+            raise ValueError("JWT_SECRET_KEY not set")
+
+        self.supabase: Client = create_client(
+            self.supabase_url,
+            self.supabase_service_key,
+        )
+
+        self.db_service = DatabaseService()
+        self.pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+        self.logger = logging.getLogger("CustomAuthService")
+
+        # JWT settings
         self.algorithm = "HS256"
         self.access_token_expire_minutes = 30
         self.refresh_token_expire_days = 7
 
     # ------------------------------------------------------------------
-    # PASSWORD HANDLING (ADMIN CONTROLLED)
+    # PASSWORD HANDLING
     # ------------------------------------------------------------------
 
     def hash_password(self, password: str) -> str:
@@ -77,23 +94,41 @@ class CustomAuthService:
             )
 
             if not result.data:
-                self.logger.warning(f"User not found: {username}")
+                await self.db_service.log_system_event(
+                    message=f"Login failed: user not found ({username})",
+                    log_level="WARNING",
+                    component="auth",
+                )
                 return None
 
             user = result.data[0]
 
             if not self.verify_password(password, user["password_hash"]):
-                self.logger.warning(f"Invalid password for user: {username}")
+                await self.db_service.log_system_event(
+                    message=f"Login failed: invalid password ({username})",
+                    log_level="WARNING",
+                    component="auth",
+                )
                 return None
 
+            # Update last login
             self.supabase.table("users").update(
                 {"last_login": datetime.utcnow().isoformat()}
             ).eq("id", user["id"]).execute()
 
+            await self.db_service.log_system_event(
+                message=f"User logged in: {username}",
+                component="auth",
+            )
+
             return user
 
         except Exception as e:
-            self.logger.error(f"Authentication error: {str(e)}")
+            await self.db_service.log_system_event(
+                message=f"Authentication error: {str(e)}",
+                log_level="ERROR",
+                component="auth",
+            )
             return None
 
     # ------------------------------------------------------------------
@@ -138,8 +173,8 @@ class CustomAuthService:
     async def create_session(
         self,
         user: Dict[str, Any],
-        ip_address: str = None,
-        user_agent: str = None,
+        ip_address: Optional[str] = None,
+        user_agent: Optional[str] = None,
     ) -> Dict[str, Any]:
 
         access_token = self.create_access_token(user)
@@ -159,6 +194,11 @@ class CustomAuthService:
         }
 
         self.supabase.table("user_sessions").insert(session_data).execute()
+
+        await self.db_service.log_system_event(
+            message=f"Session created for user_id={user['id']}",
+            component="auth_session",
+        )
 
         return {
             "access_token": access_token,
@@ -207,7 +247,11 @@ class CustomAuthService:
         except JWTError:
             return None
         except Exception as e:
-            self.logger.error(f"Token verification error: {str(e)}")
+            await self.db_service.log_system_event(
+                message=f"Token verification error: {str(e)}",
+                log_level="ERROR",
+                component="auth",
+            )
             return None
 
     # ------------------------------------------------------------------
@@ -255,6 +299,11 @@ class CustomAuthService:
                 {"last_used": datetime.utcnow().isoformat()}
             ).eq("refresh_token", refresh_token).execute()
 
+            await self.db_service.log_system_event(
+                message=f"Access token refreshed for user_id={user_id}",
+                component="auth_session",
+            )
+
             return {
                 "access_token": new_access_token,
                 "token_type": "bearer",
@@ -273,12 +322,18 @@ class CustomAuthService:
             self.supabase.table("user_sessions").delete().eq(
                 "session_token", session_token
             ).execute()
+
+            await self.db_service.log_system_event(
+                message=f"User logged out (session revoked)",
+                component="auth_session",
+            )
+
             return True
         except Exception:
             return False
 
     # ------------------------------------------------------------------
-    # ADMIN: CREATE USER ONLY
+    # ADMIN: CREATE USER
     # ------------------------------------------------------------------
 
     async def create_user(
@@ -306,6 +361,11 @@ class CustomAuthService:
 
         if not result.data:
             return None
+
+        await self.db_service.log_system_event(
+            message=f"Admin created user: {username} ({role})",
+            component="auth_admin",
+        )
 
         user = result.data[0]
         user.pop("password_hash", None)

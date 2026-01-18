@@ -25,16 +25,16 @@ API_TIMEOUT = 30
 @pytest.fixture
 def mock_db_service():
     """Mock database service for unit testing"""
-    mock_db = AsyncMock(spec=DatabaseService)
+    mock_db = MagicMock()
 
-    # Mock health check
-    mock_db.health_check.return_value = {
+    # Mock health check (async)
+    mock_db.health_check = AsyncMock(return_value={
         "database_connected": True,
         "status": "healthy",
-    }
+    })
 
-    # Mock junction data
-    mock_db.get_all_junctions.return_value = [
+    # Mock junction data (async)
+    mock_db.get_all_junctions = AsyncMock(return_value=[
         {
             "id": 1,
             "junction_name": "Test Junction 1",
@@ -47,35 +47,35 @@ def mock_db_service():
             "location": "Test Location 2",
             "status": "active",
         },
-    ]
+    ])
 
-    # Mock vehicle detection logging
-    mock_db.log_vehicle_detection.return_value = {"id": 1, "status": "logged"}
+    # Mock vehicle detection logging (async)
+    mock_db.log_vehicle_detection = AsyncMock(return_value={"id": 1, "status": "logged"})
 
-    # Mock traffic cycle logging
-    mock_db.log_traffic_cycle.return_value = {"id": 1, "status": "logged"}
+    # Mock traffic cycle logging (async)
+    mock_db.log_traffic_cycle = AsyncMock(return_value={"id": 1, "status": "logged"})
 
-    # Mock lane counts
-    mock_db.get_current_lane_counts.return_value = [
+    # Mock lane counts (async)
+    mock_db.get_current_lane_counts = AsyncMock(return_value=[
         {"lane": "North", "lane_number": 1, "count": 10},
         {"lane": "South", "lane_number": 2, "count": 8},
         {"lane": "East", "lane_number": 3, "count": 12},
         {"lane": "West", "lane_number": 4, "count": 6},
-    ]
+    ])
 
-    # Mock current traffic cycle
-    mock_db.get_current_traffic_cycle.return_value = {
+    # Mock current traffic cycle (async)
+    mock_db.get_current_traffic_cycle = AsyncMock(return_value={
         "id": 1,
         "total_cycle_time": 120,
         "total_vehicles_detected": 36,
         "cycle_start_time": "2025-09-15T12:00:00",
-    }
+    })
 
-    # Mock vehicles count by date
-    mock_db.get_vehicles_count_by_date.return_value = 150
+    # Mock vehicles count by date (async)
+    mock_db.get_vehicles_count_by_date = AsyncMock(return_value=150)
 
-    # Mock recent detections
-    mock_db.get_recent_detections_with_signals.return_value = [
+    # Mock recent detections (async)
+    mock_db.get_recent_detections_with_signals = AsyncMock(return_value=[
         {
             "id": 1,
             "fastag_id": "TEST123",
@@ -83,7 +83,10 @@ def mock_db_service():
             "vehicle_type": "car",
             "detection_timestamp": "2025-09-15T12:00:00",
         }
-    ]
+    ])
+
+    # Mock log_system_event (async)
+    mock_db.log_system_event = AsyncMock(return_value=None)
 
     return mock_db
 
@@ -91,12 +94,12 @@ def mock_db_service():
 @pytest.fixture
 def mock_traffic_calculator(mock_db_service):
     """Mock traffic calculator for unit testing"""
-    mock_calculator = AsyncMock(spec=TrafficCalculator)
+    mock_calculator = MagicMock()
 
-    # Mock calculate_green_times method
-    mock_calculator.calculate_green_times.return_value = ([30, 25, 35, 20], 110)
+    # Mock calculate_green_times method (async)
+    mock_calculator.calculate_green_times = AsyncMock(return_value=([30, 25, 35, 20], 110))
 
-    # Mock get_algorithm_info method
+    # Mock get_algorithm_info method (sync)
     mock_calculator.get_algorithm_info.return_value = {
         "algorithm": "ATCS",
         "version": "1.0",
@@ -104,11 +107,18 @@ def mock_traffic_calculator(mock_db_service):
         "optimization_level": "high",
     }
 
+    # Set the db_service attribute to the mocked database service
+    mock_calculator.db_service = mock_db_service
+
     return mock_calculator
 
 
 @pytest.fixture
-def test_client(mock_db_service, mock_traffic_calculator) -> TestClient:
+def test_client(
+    mock_db_service,
+    mock_traffic_calculator,
+) -> Generator[TestClient, None, None]:
+
     """Create FastAPI test client with mocked dependencies"""
     # Override dependencies
     app.dependency_overrides[get_db_service] = lambda: mock_db_service
