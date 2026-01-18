@@ -1,7 +1,7 @@
 import logging
 import secrets
 from datetime import datetime, timedelta
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 
 from jose import JWTError, jwt
 from passlib.context import CryptContext
@@ -12,8 +12,14 @@ from app.config import settings
 
 class CustomAuthService:
     """
-    Custom Username/Password Authentication Service
-    Uses Supabase database for user storage with JWT token management
+    Custom Username/Password Authentication Service for FlexTraffs
+
+    IMPORTANT RULES:
+    - Users CANNOT register themselves
+    - Users CANNOT change passwords
+    - Passwords are ADMIN controlled
+    - Roles allowed: OPERATOR, OBSERVER
+    - Junction-level access is enforced via JWT
     """
 
     def __init__(self):
@@ -29,24 +35,41 @@ class CustomAuthService:
         self.access_token_expire_minutes = 30
         self.refresh_token_expire_days = 7
 
+    # ------------------------------------------------------------------
+    # PASSWORD HANDLING (ADMIN CONTROLLED)
+    # ------------------------------------------------------------------
+
     def hash_password(self, password: str) -> str:
-        """Hash password using bcrypt"""
         return self.pwd_context.hash(password)
 
     def verify_password(self, plain_password: str, hashed_password: str) -> bool:
-        """Verify password against hash"""
         return self.pwd_context.verify(plain_password, hashed_password)
+
+    # ------------------------------------------------------------------
+    # JUNCTION ACCESS
+    # ------------------------------------------------------------------
+
+    def get_user_junctions(self, user_id: int) -> List[int]:
+        result = (
+            self.supabase
+            .table("user_junctions")
+            .select("junction_id")
+            .eq("user_id", user_id)
+            .execute()
+        )
+        return [row["junction_id"] for row in result.data] if result.data else []
+
+    # ------------------------------------------------------------------
+    # AUTHENTICATION
+    # ------------------------------------------------------------------
 
     async def authenticate_user(
         self, username: str, password: str
     ) -> Optional[Dict[str, Any]]:
-        """
-        Authenticate user with username/password
-        """
         try:
-            # Get user from database
             result = (
-                self.supabase.table("users")
+                self.supabase
+                .table("users")
                 .select("*")
                 .eq("username", username)
                 .eq("is_active", True)
@@ -59,103 +82,115 @@ class CustomAuthService:
 
             user = result.data[0]
 
-            # Verify password
             if not self.verify_password(password, user["password_hash"]):
                 self.logger.warning(f"Invalid password for user: {username}")
                 return None
 
-            # Update last login
             self.supabase.table("users").update(
-                {"last_login": datetime.now().isoformat()}
+                {"last_login": datetime.utcnow().isoformat()}
             ).eq("id", user["id"]).execute()
 
-            self.logger.info(f"User authenticated successfully: {username}")
             return user
 
         except Exception as e:
-            self.logger.error(f"Authentication error for {username}: {str(e)}")
+            self.logger.error(f"Authentication error: {str(e)}")
             return None
 
+    # ------------------------------------------------------------------
+    # JWT TOKEN CREATION
+    # ------------------------------------------------------------------
+
     def create_access_token(self, user_data: Dict[str, Any]) -> str:
-        """Create JWT access token"""
-        expire = datetime.utcnow() + timedelta(minutes=self.access_token_expire_minutes)
-        to_encode = {
+        expire = datetime.utcnow() + timedelta(
+            minutes=self.access_token_expire_minutes
+        )
+
+        junction_ids = self.get_user_junctions(user_data["id"])
+
+        payload = {
             "sub": str(user_data["id"]),
             "username": user_data["username"],
             "role": user_data["role"],
+            "junction_ids": junction_ids,
             "exp": expire,
             "type": "access",
         }
-        return jwt.encode(to_encode, self.secret_key, algorithm=self.algorithm)
+
+        return jwt.encode(payload, self.secret_key, algorithm=self.algorithm)
 
     def create_refresh_token(self, user_data: Dict[str, Any]) -> str:
-        """Create JWT refresh token"""
-        expire = datetime.utcnow() + timedelta(days=self.refresh_token_expire_days)
-        to_encode = {
+        expire = datetime.utcnow() + timedelta(
+            days=self.refresh_token_expire_days
+        )
+
+        payload = {
             "sub": str(user_data["id"]),
-            "username": user_data["username"],
             "exp": expire,
             "type": "refresh",
         }
-        return jwt.encode(to_encode, self.secret_key, algorithm=self.algorithm)
+
+        return jwt.encode(payload, self.secret_key, algorithm=self.algorithm)
+
+    # ------------------------------------------------------------------
+    # SESSION MANAGEMENT
+    # ------------------------------------------------------------------
 
     async def create_session(
-        self, user: Dict[str, Any], ip_address: str = None, user_agent: str = None
+        self,
+        user: Dict[str, Any],
+        ip_address: str = None,
+        user_agent: str = None,
     ) -> Dict[str, Any]:
-        """Create user session with tokens"""
-        try:
-            access_token = self.create_access_token(user)
-            refresh_token = self.create_refresh_token(user)
 
-            # Generate unique session token
-            session_token = secrets.token_urlsafe(32)
+        access_token = self.create_access_token(user)
+        refresh_token = self.create_refresh_token(user)
+        session_token = secrets.token_urlsafe(32)
 
-            # Store session in database
-            session_data = {
-                "user_id": user["id"],
-                "session_token": session_token,
-                "refresh_token": refresh_token,
-                "expires_at": (
-                    datetime.now() + timedelta(days=self.refresh_token_expire_days)
-                ).isoformat(),
-                "ip_address": ip_address,
-                "user_agent": user_agent,
-            }
+        session_data = {
+            "user_id": user["id"],
+            "session_token": session_token,
+            "refresh_token": refresh_token,
+            "expires_at": (
+                datetime.utcnow()
+                + timedelta(days=self.refresh_token_expire_days)
+            ).isoformat(),
+            "ip_address": ip_address,
+            "user_agent": user_agent,
+        }
 
-            session_result = (
-                self.supabase.table("user_sessions").insert(session_data).execute()
-            )
+        self.supabase.table("user_sessions").insert(session_data).execute()
 
-            return {
-                "access_token": access_token,
-                "refresh_token": refresh_token,
-                "session_token": session_token,
-                "token_type": "bearer",
-                "expires_in": self.access_token_expire_minutes * 60,
-                "user": {
-                    "id": user["id"],
-                    "username": user["username"],
-                    "full_name": user["full_name"],
-                    "role": user["role"],
-                },
-            }
+        return {
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "session_token": session_token,
+            "token_type": "bearer",
+            "expires_in": self.access_token_expire_minutes * 60,
+            "user": {
+                "id": user["id"],
+                "username": user["username"],
+                "full_name": user["full_name"],
+                "role": user["role"],
+            },
+        }
 
-        except Exception as e:
-            self.logger.error(f"Session creation error: {str(e)}")
-            raise
+    # ------------------------------------------------------------------
+    # TOKEN VERIFICATION
+    # ------------------------------------------------------------------
 
     async def verify_token(self, token: str) -> Optional[Dict[str, Any]]:
-        """Verify JWT token and return user data"""
         try:
-            payload = jwt.decode(token, self.secret_key, algorithms=[self.algorithm])
-            user_id = payload.get("sub")
+            payload = jwt.decode(
+                token, self.secret_key, algorithms=[self.algorithm]
+            )
 
-            if user_id is None:
+            user_id = payload.get("sub")
+            if not user_id:
                 return None
 
-            # Get user from database
             result = (
-                self.supabase.table("users")
+                self.supabase
+                .table("users")
                 .select("*")
                 .eq("id", int(user_id))
                 .eq("is_active", True)
@@ -169,17 +204,19 @@ class CustomAuthService:
             user["token_data"] = payload
             return user
 
-        except JWTError as e:
-            self.logger.warning(f"Token verification failed: {str(e)}")
+        except JWTError:
             return None
         except Exception as e:
             self.logger.error(f"Token verification error: {str(e)}")
             return None
 
+    # ------------------------------------------------------------------
+    # TOKEN REFRESH
+    # ------------------------------------------------------------------
+
     async def refresh_access_token(
         self, refresh_token: str
     ) -> Optional[Dict[str, Any]]:
-        """Refresh access token using refresh token"""
         try:
             payload = jwt.decode(
                 refresh_token, self.secret_key, algorithms=[self.algorithm]
@@ -190,37 +227,32 @@ class CustomAuthService:
 
             user_id = payload.get("sub")
 
-            # Verify session exists
-            session_result = (
-                self.supabase.table("user_sessions")
+            session = (
+                self.supabase
+                .table("user_sessions")
                 .select("*")
                 .eq("refresh_token", refresh_token)
                 .eq("user_id", int(user_id))
-                .gte("expires_at", datetime.now().isoformat())
+                .gte("expires_at", datetime.utcnow().isoformat())
                 .execute()
             )
 
-            if not session_result.data:
+            if not session.data:
                 return None
 
-            # Get user data
-            user_result = (
-                self.supabase.table("users")
+            user = (
+                self.supabase
+                .table("users")
                 .select("*")
                 .eq("id", int(user_id))
                 .eq("is_active", True)
                 .execute()
-            )
+            ).data[0]
 
-            if not user_result.data:
-                return None
-
-            user = user_result.data[0]
             new_access_token = self.create_access_token(user)
 
-            # Update session last_used
             self.supabase.table("user_sessions").update(
-                {"last_used": datetime.now().isoformat()}
+                {"last_used": datetime.utcnow().isoformat()}
             ).eq("refresh_token", refresh_token).execute()
 
             return {
@@ -229,53 +261,52 @@ class CustomAuthService:
                 "expires_in": self.access_token_expire_minutes * 60,
             }
 
-        except JWTError:
+        except Exception:
             return None
-        except Exception as e:
-            self.logger.error(f"Token refresh error: {str(e)}")
-            return None
+
+    # ------------------------------------------------------------------
+    # LOGOUT
+    # ------------------------------------------------------------------
 
     async def logout(self, session_token: str) -> bool:
-        """Logout user by removing session"""
         try:
-            result = (
-                self.supabase.table("user_sessions")
-                .delete()
-                .eq("session_token", session_token)
-                .execute()
-            )
-
+            self.supabase.table("user_sessions").delete().eq(
+                "session_token", session_token
+            ).execute()
             return True
-
-        except Exception as e:
-            self.logger.error(f"Logout error: {str(e)}")
+        except Exception:
             return False
 
+    # ------------------------------------------------------------------
+    # ADMIN: CREATE USER ONLY
+    # ------------------------------------------------------------------
+
     async def create_user(
-        self, username: str, password: str, full_name: str, role: str = "user"
+        self,
+        username: str,
+        password: str,
+        full_name: str,
+        role: str,
     ) -> Optional[Dict[str, Any]]:
-        """Create new user (admin only)"""
-        try:
-            password_hash = self.hash_password(password)
 
-            user_data = {
-                "username": username,
-                "password_hash": password_hash,
-                "full_name": full_name,
-                "role": role,
-                "is_active": True,
-            }
+        if role not in ["OPERATOR", "OBSERVER"]:
+            raise ValueError("Invalid role")
 
-            result = self.supabase.table("users").insert(user_data).execute()
+        password_hash = self.hash_password(password)
 
-            if result.data:
-                created_user = result.data[0]
-                # Remove password hash from response
-                created_user.pop("password_hash", None)
-                return created_user
+        user_data = {
+            "username": username,
+            "password_hash": password_hash,
+            "full_name": full_name,
+            "role": role,
+            "is_active": True,
+        }
 
+        result = self.supabase.table("users").insert(user_data).execute()
+
+        if not result.data:
             return None
 
-        except Exception as e:
-            self.logger.error(f"User creation error: {str(e)}")
-            return None
+        user = result.data[0]
+        user.pop("password_hash", None)
+        return user

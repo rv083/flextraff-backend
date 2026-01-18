@@ -11,6 +11,9 @@ import logging
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional
 from mqtt_handler import mqtt
+from fastapi import WebSocket, WebSocketDisconnect
+from ws_broadcast import manager  # relative import depending on location
+
 
 
 
@@ -450,6 +453,26 @@ async def general_exception_handler(request, exc):
     return JSONResponse(
         status_code=500, content={"error": "Internal server error", "status_code": 500}
     )
+
+@app.websocket("/ws/logs")
+async def websocket_logs_endpoint(websocket: WebSocket):
+    """
+    Clients connect here to receive live log/messages from MQTT and internal events.
+    """
+    await manager.connect(websocket)
+    try:
+        while True:
+            # keep the socket open; don't need to read client messages
+            # but reading will keep connection alive if ping/pong implemented
+            msg = await websocket.receive_text()
+            # optional: respond to ping messages if your client sends them
+            if msg == "ping":
+                await websocket.send_text('{"type":"pong"}')
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
+    except Exception:
+        manager.disconnect(websocket)
+
 
 
 if __name__ == "__main__":

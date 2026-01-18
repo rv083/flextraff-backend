@@ -3,6 +3,8 @@ import json
 import httpx
 import asyncio
 import logging
+# existing imports...
+from ws_broadcast import manager  # import the manager to broadcast messages
 
 logger = logging.getLogger(__name__)
 
